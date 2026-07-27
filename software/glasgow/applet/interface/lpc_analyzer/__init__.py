@@ -1,5 +1,6 @@
 import sys
 import argparse
+from contextlib import contextmanager
 from amaranth import *
 from amaranth.lib import data, wiring, stream, io, cdc
 from amaranth.lib.wiring import Out
@@ -25,7 +26,14 @@ class LPCAnalyzerFrontend(wiring.Component):
         "data": 8,
         "start": 1,
     })))
+
+    # Asserted if the backpressure on `stream` causes an overflow. Once asserted,
+    # this signal stays high.
     overflow: Out(1)
+
+    # Asserted when the bus is idle, to indicate that the transaction is complete
+    # and the next payload sent over the `stream` will have the `start` bit set.
+    idle: Out(1)
 
     def __init__(self, ports):
         self._ports = ports
@@ -40,8 +48,7 @@ class LPCAnalyzerFrontend(wiring.Component):
         m.submodules.lad_buffer    = lad_buffer    = io.Buffer("i", self._ports.lad)
 
         if platform is not None:
-            # With some margin above the spec value of 33 MHz
-            platform.add_clock_constraint(lclk_buffer.i, 40e6)
+            platform.add_clock_constraint(lclk_buffer.i, 33e6)
 
         m.domains.lpc = cd_lpc = ClockDomain(clk_edge="neg", local=True)
         m.d.comb += cd_lpc.clk.eq(lclk_buffer.i)
@@ -55,6 +62,116 @@ class LPCAnalyzerFrontend(wiring.Component):
         )
         wiring.connect(m, wiring.flipped(self.stream), fifo.o)
 
+        # Actual LPC Protocol
+        nibble = Signal(4)
+        MAX_PRE_TAR = 5
+        bytes_remaining = Signal(range(MAX_PRE_TAR))
+        wait_states = Signal(6)
+        is_read = Signal(1)
+
+        @contextmanager
+        def lframe_high_and_state(name):
+            with m.State(name):
+                with m.If(~lframe_buffer.i):
+                    m.d.lpc += nibble.eq(lad_buffer.i)
+                    m.next = "START"
+                with m.Else():
+                    yield
+
+        with m.FSM(domain="lpc") as fsm:
+            with lframe_high_and_state("Idle"):
+                # LFRAME being low gets handled below, for all FSM states
+                # at once. The idle state does not need to do anything else.
+                pass
+
+            with lframe_high_and_state("START"):
+                m.d.comb += fifo.i.p.data.eq(Cat(lad_buffer.i, nibble))
+                m.d.comb += fifo.i.p.start.eq(1)
+                m.d.comb += fifo.i.valid.eq(1)
+
+                with m.Switch(nibble):
+                    with m.Case(START_TARGET):
+                        cyctype = lad_buffer.i[2:3]
+                        direction = lad_buffer.i[1]
+
+                        # Number of bytes to capture before the TAR+SYNC
+                        length_before_tar = Signal(range(MAX_PRE_TAR + 1))
+                        with m.Switch(cyctype):
+                            with m.Case(CYCTYPE_IO):
+                                with m.If(direction == DIR_WRITE):
+                                    m.d.comb += length_before_tar.eq(3)
+                                with m.Else():
+                                    m.d.comb += length_before_tar.eq(2)
+
+                            with m.Case(CYCTYPE_MEM):
+                                with m.If(direction == DIR_WRITE):
+                                    m.d.comb += length_before_tar.eq(5)
+                                with m.Else():
+                                    m.d.comb += length_before_tar.eq(4)
+
+                            with m.Default():
+                                m.d.comb += length_before_tar.eq(0)
+
+                        with m.If(length_before_tar == 0):
+                            m.next = "Idle"
+                        with m.Else():
+                            m.d.lpc += bytes_remaining.eq(length_before_tar - 1)
+                            m.d.lpc += is_read.eq(direction == DIR_READ)
+                            m.next = "nib1"
+
+                    with m.Default():
+                        m.next = "Idle"
+
+            with lframe_high_and_state("nib1"):
+                m.d.lpc += nibble.eq(lad_buffer.i)
+                m.next = "nib2"
+
+            with lframe_high_and_state("nib2"):
+                m.d.comb += fifo.i.p.data.eq(Cat(lad_buffer.i, nibble))
+                m.d.comb += fifo.i.valid.eq(1)
+
+                with m.If(bytes_remaining == 0):
+                    m.next = "TAR1"
+                with m.Else():
+                    m.d.lpc += bytes_remaining.eq(bytes_remaining - 1)
+                    m.next = "nib1"
+
+            with lframe_high_and_state("TAR1"):
+                m.next = "TAR2"
+            with lframe_high_and_state("TAR2"):
+                m.next = "SYNC"
+                m.d.lpc += wait_states.eq(0)
+
+            with lframe_high_and_state("SYNC"):
+                with m.Switch(lad_buffer.i):
+                    with m.Case(SYNC_SHORT_WAIT, SYNC_LONG_WAIT):
+                        with m.If(~wait_states.all()):
+                            m.d.lpc += wait_states.eq(wait_states + 1)
+
+                    with m.Case(SYNC_READY, SYNC_READY_MORE, SYNC_ERROR):
+                        # The low bits vary between these, so let's reuse them in our packed encoding.
+                        m.d.comb += fifo.i.p.data.eq(Cat(wait_states, lad_buffer.i[:2]))
+                        m.d.comb += fifo.i.valid.eq(1)
+                        with m.If(is_read):
+                            m.next = "resp1"
+                        with m.Else():
+                            m.next = "Idle"
+
+                    with m.Default():
+                        # Indicate protocol error
+                        m.d.comb += fifo.i.p.data.eq(Cat(wait_states, C(0b11, 2)))
+                        m.d.comb += fifo.i.valid.eq(1)
+                        m.next = "Idle"
+
+            with lframe_high_and_state("resp1"):
+                m.d.lpc += nibble.eq(lad_buffer.i)
+                m.next = "resp2"
+
+            with lframe_high_and_state("resp2"):
+                m.d.comb += fifo.i.p.data.eq(Cat(lad_buffer.i, nibble))
+                m.d.comb += fifo.i.valid.eq(1)
+                m.next = "Idle"
+
         # Overflow handling
         overflow_lpc = Signal()
         with m.If(fifo.i.valid & ~fifo.i.ready):
@@ -65,72 +182,8 @@ class LPCAnalyzerFrontend(wiring.Component):
         with m.If(overflow_sync):
             m.d.sync += self.overflow.eq(1)
 
-        # Actual LPC Protocol
-
-        nibble = Signal(4)
-        MAX_PRE_TAR = 5
-        bytes_remaining = Signal(range(MAX_PRE_TAR))
-
-        with m.FSM(domain="lpc"):
-            with m.State("Idle"):
-                with m.If(~lframe_buffer.i):
-                    m.d.lpc += nibble.eq(lad_buffer.i)
-                    m.next = "START"
-
-            with m.State("START"):
-                with m.If(~lframe_buffer.i):
-                    m.d.lpc += nibble.eq(lad_buffer.i)
-                with m.Else():
-                    m.d.comb += fifo.i.p.data.eq(Cat(nibble, lad_buffer.i))
-                    m.d.comb += fifo.i.p.start.eq(1)
-                    m.d.comb += fifo.i.valid.eq(1)
-
-                    with m.Switch(nibble):
-                        with m.Case(START_TARGET):
-                            cyctype = lad_buffer.i[2:3]
-                            direction = lad_buffer.i[1]
-
-                            # Number of bytes to capture before the TAR+SYNC
-                            length_before_tar = Signal(range(MAX_PRE_TAR + 1))
-                            with m.Switch(cyctype):
-                                with m.Case(CYCTYPE_IO):
-                                    with m.If(direction == DIR_WRITE):
-                                        m.d.comb += length_before_tar.eq(3)
-                                    with m.Else():
-                                        m.d.comb += length_before_tar.eq(2)
-
-                                with m.Case(CYCTYPE_MEM):
-                                    with m.If(direction == DIR_WRITE):
-                                        m.d.comb += length_before_tar.eq(5)
-                                    with m.Else():
-                                        m.d.comb += length_before_tar.eq(4)
-
-                                with m.Default():
-                                    m.d.comb += length_before_tar.eq(0)
-
-                            with m.If(length_before_tar == 0):
-                                m.next = "Idle"
-                            with m.Else():
-                                m.d.lpc += bytes_remaining.eq(length_before_tar - 1)
-                                m.next = "nib1"
-
-                        with m.Default():
-                            m.next = "Idle"
-
-            with m.State("nib1"):
-                m.d.lpc += nibble.eq(lad_buffer.i)
-                m.next = "nib2"
-
-            with m.State("nib2"):
-                m.d.comb += fifo.i.p.data.eq(Cat(lad_buffer.i, nibble))
-                m.d.comb += fifo.i.valid.eq(1)
-
-                with m.If(bytes_remaining == 0):
-                    m.next = "Idle"
-                with m.Else():
-                    m.d.lpc += bytes_remaining.eq(bytes_remaining - 1)
-                    m.next = "nib1"
-
+        # Idle indication
+        m.submodules.idle_sync = cdc.FFSynchronizer(fsm.ongoing("Idle"), self.idle)
         return m
 
 
@@ -173,6 +226,11 @@ class LPCAnalyzerComponent(wiring.Component):
                         m.d.comb += encoder.i.valid.eq(1)
                         with m.If(encoder.i.ready):
                             m.d.comb += frontend.stream.ready.eq(1)
+                with m.Elif(frontend.idle):
+                    m.d.comb += encoder.i.p.end.eq(1)
+                    m.d.comb += encoder.i.valid.eq(1)
+                    with m.If(encoder.i.ready):
+                        m.next = "Initial"
 
         m.d.comb += self.overflow.eq(frontend.overflow)
         return m
