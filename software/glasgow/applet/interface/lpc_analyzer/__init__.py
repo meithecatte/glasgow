@@ -1,3 +1,7 @@
+# Ref: Intel® Low Pin Count (LPC) Interface Specification
+# Document Number: 251289-001
+# Accession: G00019
+
 import sys
 import argparse
 from contextlib import contextmanager
@@ -14,12 +18,66 @@ from glasgow.applet import GlasgowAppletError, GlasgowAppletV2
 from glasgow.arch.lpc import *
 
 
-__all__ = ["LPCAnalyzerOverflow", "LPCAnalyzerApplet"]
+__all__ = ["LPCAnalyzerOverflow", "LPCAnalyzerComponent", "LPCAnalyzerApplet"]
 
 
 class LPCAnalyzerOverflow(GlasgowAppletError):
     pass
 
+
+# The protocol between the gateware and the software is based on COBS-encoded packets.
+# Each packet corresponds to one transaction, which we consider to start every time
+# LFRAME is strobed. This means, that if a transaction gets aborted, the packet describing
+# the actual transaction will be cut short, and we will transmit the abort itself
+# as a separate packet.
+#
+# As the packet data is being generated live while the transaction is being received,
+# the structure of the packets closely follows the protocol as seen on-the-wires.
+# Whenever the contents of a byte directly come from nibbles transmitted on the LPC bus,
+# the more-significant nibble contains the part that came first. Effectively, any addresses
+# contained within the transactions get transmitted as plain-old big endian, while data
+# bytes need to have their nibbles swapped.
+
+# The first byte of each packet consists of the value of the START field, and the nibble
+# immediately following it. For the implemented transaction types, that nibble is
+# the CYCTYPE+DIR field.
+class PacketHeader(data.Struct):
+    nibble2:    4
+    start:      Start
+
+# If a transaction type is unrecognized, only that initial byte is transmitted.
+# Otherwise, all the actual content of the transaction gets transcribed as is,
+# with a byte of metadata inserted whenever the bus gets turned around.
+#
+# While a turnaround doesn't itself get encoded in any way, the SYNC that
+# follows gets encoded into a byte which records the final value of the SYNC
+# field, as well as the number of waitstates that occurred before it.
+class SyncByte(data.Struct):
+    # The values of this enum (except for Reserved) are assigned to match
+    # the low two bits of the corresponding Sync value.
+    class Kind(data.Enum):
+        Ready       = 0b00
+        ReadyMore   = 0b01
+        # Device indicates error condition, data nevertheless follows.
+        Error       = 0b10
+        # Reserved value, usually caused by the device not responding at all.
+        Reserved    = 0b11
+
+        def from_sync(sync: Sync) -> Kind:
+            return \
+                Mux(sync == Sync.Ready,     SyncByte.Kind.Ready,
+                Mux(sync == Sync.ReadyMore, SyncByte.Kind.ReadyMore,
+                Mux(sync == Sync.Error,     SyncByte.Kind.Error,
+                    SyncByte.Kind.Reserved)))
+
+    wait: 6
+    kind: Kind
+
+# High-level structure:
+#
+# The LPCAnalyzerFrontend is driven by the LPC clock, and encodes the bus transactions
+# into the packet format described above. This is then consumed by LPCAnalyzerComponent,
+# which runs in the main sync clock domain, and drives the COBS encoder.
 
 class LPCAnalyzerFrontend(wiring.Component):
     stream: Out(stream.Signature(data.StructLayout({
@@ -67,8 +125,15 @@ class LPCAnalyzerFrontend(wiring.Component):
         MAX_PRE_TAR = 5
         bytes_remaining = Signal(range(MAX_PRE_TAR))
         wait_states = Signal(6)
-        is_read = Signal(1)
+        cur_dir = Signal(Dir)
 
+        # To handle aborts, LFRAME being low is handled homogenously across
+        # all states of the FSM.
+        #
+        # Note that if an abort occurs in place of the second nibble of a byte,
+        # the first nibble of said byte will effectively get discarded. This
+        # shouldn't be a problem in practice, because aborts happen for a
+        # reason, and the first nibble of a byte ain't one.
         @contextmanager
         def lframe_high_and_state(name):
             with m.State(name):
@@ -80,43 +145,45 @@ class LPCAnalyzerFrontend(wiring.Component):
 
         with m.FSM(domain="lpc") as fsm:
             with lframe_high_and_state("Idle"):
-                # LFRAME being low gets handled below, for all FSM states
-                # at once. The idle state does not need to do anything else.
                 pass
 
             with lframe_high_and_state("START"):
-                m.d.comb += fifo.i.p.data.eq(Cat(lad_buffer.i, nibble))
+                start = Start(nibble)
+
+                header = PacketHeader(fifo.i.p.data)
+                m.d.comb += header.start.eq(start)
+                m.d.comb += header.nibble2.eq(lad_buffer.i)
                 m.d.comb += fifo.i.p.start.eq(1)
                 m.d.comb += fifo.i.valid.eq(1)
 
-                with m.Switch(nibble):
-                    with m.Case(START_TARGET):
-                        cyctype = lad_buffer.i[2:3]
-                        direction = lad_buffer.i[1]
+                with m.Switch(start):
+                    with m.Case(Start.Target):
+                        cyc = CyctypeDir(lad_buffer.i)
 
                         # Number of bytes to capture before the TAR+SYNC
-                        length_before_tar = Signal(range(MAX_PRE_TAR + 1))
-                        with m.Switch(cyctype):
-                            with m.Case(CYCTYPE_IO):
-                                with m.If(direction == DIR_WRITE):
-                                    m.d.comb += length_before_tar.eq(3)
+                        length = Signal(range(MAX_PRE_TAR + 1))
+                        with m.Switch(cyc.type):
+                            with m.Case(Cyctype.IO):
+                                with m.If(cyc.dir == Dir.Write):
+                                    m.d.comb += length.eq(3)
                                 with m.Else():
-                                    m.d.comb += length_before_tar.eq(2)
+                                    m.d.comb += length.eq(2)
 
-                            with m.Case(CYCTYPE_MEM):
-                                with m.If(direction == DIR_WRITE):
-                                    m.d.comb += length_before_tar.eq(5)
+                            with m.Case(Cyctype.Mem):
+                                with m.If(cyc.dir == Dir.Write):
+                                    m.d.comb += length.eq(5)
                                 with m.Else():
-                                    m.d.comb += length_before_tar.eq(4)
+                                    m.d.comb += length.eq(4)
 
                             with m.Default():
-                                m.d.comb += length_before_tar.eq(0)
+                                # Unimplemented, go back to idle
+                                m.d.comb += length.eq(0)
 
-                        with m.If(length_before_tar == 0):
+                        with m.If(length == 0):
                             m.next = "Idle"
                         with m.Else():
-                            m.d.lpc += bytes_remaining.eq(length_before_tar - 1)
-                            m.d.lpc += is_read.eq(direction == DIR_READ)
+                            m.d.lpc += bytes_remaining.eq(length - 1)
+                            m.d.lpc += cur_dir.eq(cyc.dir)
                             m.next = "nib1"
 
                     with m.Default():
@@ -143,23 +210,29 @@ class LPCAnalyzerFrontend(wiring.Component):
                 m.d.lpc += wait_states.eq(0)
 
             with lframe_high_and_state("SYNC"):
-                with m.Switch(lad_buffer.i):
-                    with m.Case(SYNC_SHORT_WAIT, SYNC_LONG_WAIT):
+                sync = Sync(lad_buffer.i)
+                with m.Switch(Sync(lad_buffer.i)):
+                    with m.Case(Sync.ShortWait, Sync.LongWait):
+                        # Saturate the counter
                         with m.If(~wait_states.all()):
                             m.d.lpc += wait_states.eq(wait_states + 1)
 
-                    with m.Case(SYNC_READY, SYNC_READY_MORE, SYNC_ERROR):
-                        # The low bits vary between these, so let's reuse them in our packed encoding.
-                        m.d.comb += fifo.i.p.data.eq(Cat(wait_states, lad_buffer.i[:2]))
+                    with m.Case(Sync.Ready, Sync.ReadyMore, Sync.Error):
+                        sb = SyncByte(fifo.i.p.data)
+                        m.d.comb += sb.kind.eq(SyncByte.Kind.from_sync(sync))
+                        m.d.comb += sb.wait.eq(wait_states)
                         m.d.comb += fifo.i.valid.eq(1)
-                        with m.If(is_read):
+
+                        with m.If(cur_dir == Dir.Read):
                             m.next = "resp1"
                         with m.Else():
                             m.next = "Idle"
 
                     with m.Default():
                         # Indicate protocol error
-                        m.d.comb += fifo.i.p.data.eq(Cat(wait_states, C(0b11, 2)))
+                        sb = SyncByte(fifo.i.p.data)
+                        m.d.comb += sb.kind.eq(SyncByte.Kind.Reserved)
+                        m.d.comb += sb.wait.eq(wait_states)
                         m.d.comb += fifo.i.valid.eq(1)
                         m.next = "Idle"
 

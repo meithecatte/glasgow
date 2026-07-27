@@ -42,32 +42,43 @@
 # I/O write (peripheral driving DATA):
 #  START | TAR[2] | CYCTYPE+DIR | ADDR[4] | SIZE | DATA[2m] | TAR[2]  | SYNC[n]  | TAR[2]
 
-START_TARGET        = 0b0000
-START_BUS_MASTER_0  = 0b0010
-START_BUS_MASTER_1  = 0b0011
-START_FW_MEM_READ   = 0b1101
-START_FW_MEM_WRITE  = 0b1110
-STOP_ABORT          = 0b1111
+from amaranth.lib import data, enum
 
-DIR_READ            = 0b0
-DIR_WRITE           = 0b1
+class Start(enum.Enum, shape=4):
+    Target      = 0b0000
+    BusMaster0  = 0b0010
+    BusMaster1  = 0b0011
+    FwMemRead   = 0b1101
+    FwMemWrite  = 0b1110
+    Abort       = 0b1111
 
-CYCTYPE_IO          = 0b00
-CYCTYPE_MEM         = 0b01
-CYCTYPE_DMA         = 0b10
+class Dir(enum.Enum, shape=1):
+    Read        = 0b0
+    Write       = 0b1
 
-SIZE_1_BYTE         = 0b00
-SIZE_2_BYTE         = 0b01
-SIZE_4_BYTE         = 0b11
+class Cyctype(enum.Enum, shape=2):
+    IO          = 0b00
+    Mem         = 0b01
+    DMA         = 0b10
 
-SYNC_READY          = 0b0000
-SYNC_SHORT_WAIT     = 0b0101
-SYNC_LONG_WAIT      = 0b0110
-SYNC_READY_MORE     = 0b1001
-SYNC_ERROR          = 0b1010
+class CyctypeDir(data.Struct):
+    reserved:   1
+    dir:        Dir
+    type:       Cyctype
 
-MSIZE_1_BYTE        = 0b0000
-MSIZE_2_BYTE        = 0b0001
-MSIZE_4_BYTE        = 0b0010
-MSIZE_16_BYTE       = 0b0100
-MSIZE_128_BYTE      = 0b0111
+SIZE_1_BYTE     = 0b00
+SIZE_2_BYTE     = 0b01
+SIZE_4_BYTE     = 0b11
+
+class Sync(enum.Enum, shape=4):
+    Ready       = 0b0000
+    ShortWait   = 0b0101
+    LongWait    = 0b0110
+    ReadyMore   = 0b1001
+    Error       = 0b1010
+
+MSIZE_1_BYTE    = 0b0000
+MSIZE_2_BYTE    = 0b0001
+MSIZE_4_BYTE    = 0b0010
+MSIZE_16_BYTE   = 0b0100
+MSIZE_128_BYTE  = 0b0111
