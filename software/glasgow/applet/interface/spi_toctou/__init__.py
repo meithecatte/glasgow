@@ -212,7 +212,8 @@ class SPIToctouComponent(wiring.Component):
                     m.next = "Done"
 
             with m.State("Done"):
-                pass
+                with m.If(addr_is_valid & addr_is_target):
+                    m.next = "Initial"
 
         # logging of accessed addresses
         m.submodules.fifo = fifo = AsyncQueue(
