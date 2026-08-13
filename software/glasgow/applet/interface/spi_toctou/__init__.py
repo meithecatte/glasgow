@@ -201,8 +201,10 @@ class SPIToctouComponent(wiring.Component):
 
         m.d.comb += enframer.enable.eq(intercept_cs | start_intercept)
 
+        # there is a combinational path from COPI to addr[0]. skip matching on the LSB
+        # of the address to reduce the effective hold time of the COPI signal.
+        addr_is_target = addr_listener.o_stream.p[1:] == C(self._target_addr)[1:]
         addr_is_valid = ~cs_buffer.i & addr_listener.o_stream.valid
-        addr_is_target = addr_listener.o_stream.p == self._target_addr
         with m.FSM(domain="sck"):
             with m.State("Initial"):
                 with m.If(addr_is_valid & addr_is_target):
