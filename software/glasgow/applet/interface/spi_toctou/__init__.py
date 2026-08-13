@@ -142,6 +142,10 @@ class SPIToctouComponent(wiring.Component):
         m.submodules.cipo_buffer = cipo_buffer = io.Buffer("o", self._ports.cipo)
         m.submodules.cs_outbuf   = cs_outbuf   = io.Buffer("o", self._ports.cs_out)
 
+        if self._ports.debug:
+            m.submodules.debug_buf   = debug_buf   = io.Buffer("o", self._ports.debug)
+            m.d.comb += debug_buf.o.eq(sck_buffer.i)
+
         if platform is not None:
             platform.add_clock_constraint(sck_buffer.i, 20e6)
 
@@ -239,11 +243,12 @@ class SPIToctouComponent(wiring.Component):
 class SPIToctouInterface:
     def __init__(self, logger: logging.Logger, assembly: AbstractAssembly, *,
                  cs: GlasgowPin, sck: GlasgowPin, copi: GlasgowPin, cipo: GlasgowPin, cs_out: GlasgowPin,
+                 debug: Optional[GlasgowPin],
                  target_addr: int, payload: bytes):
         self._logger = logger
         self._level  = logging.DEBUG if self._logger.name == __name__ else logging.TRACE
 
-        ports = assembly.add_port_group(cs=cs, sck=sck, copi=copi, cipo=cipo, cs_out=cs_out)
+        ports = assembly.add_port_group(cs=cs, sck=sck, copi=copi, cipo=cipo, cs_out=cs_out, debug=debug)
         component = assembly.add_submodule(SPIToctouComponent(ports, target_addr, payload))
         self._pipe = assembly.add_in_pipe(component.o_stream)
 
@@ -262,6 +267,7 @@ class SPIToctouApplet(GlasgowAppletV2):
         access.add_pins_argument(parser, "copi",   required=True)
         access.add_pins_argument(parser, "cipo",   required=True)
         access.add_pins_argument(parser, "cs_out", required=True)
+        access.add_pins_argument(parser, "debug")
         parser.add_argument(
             "--target-addr", metavar="ADDR", type=lambda x: int(x, 0), required=True,
             help="specify the address at which the intercept should start")
@@ -275,6 +281,7 @@ class SPIToctouApplet(GlasgowAppletV2):
             self.assembly.use_pulls({args.cs: "high"})
             self.spi_toctou_iface = SPIToctouInterface(self.logger, self.assembly,
                 cs=args.cs, sck=args.sck, copi=args.copi, cipo=args.cipo, cs_out=args.cs_out,
+                debug=args.debug,
                 target_addr=args.target_addr, payload=args.payload.read())
 
     async def run(self, args):
