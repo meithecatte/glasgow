@@ -73,18 +73,26 @@ class PayloadMemory(wiring.Component):
     def elaborate(self, platform):
         m = Module()
 
+        payload = self._payload
+        if len(payload) % 2 != 0:
+            payload += b'\0'
+
+        init = [payload[i] + 256 * payload[i+1] for i in range(0, len(payload), 2)]
         m.submodules.memory = memory = \
-                Memory(shape=unsigned(8), depth=len(self._payload), init=self._payload)
+                Memory(shape=unsigned(16), depth=len(init), init=init)
         rd_port = memory.read_port(domain="comb")
 
         next_addr = Signal(self._addr_width)
+        addr = Signal(self._addr_width)
 
         with m.If(self.i_addrs.valid):
-            m.d.comb += rd_port.addr.eq(self.i_addrs.p)
+            m.d.comb += addr.eq(self.i_addrs.p)
         with m.Else():
-            m.d.comb += rd_port.addr.eq(next_addr)
+            m.d.comb += addr.eq(next_addr)
 
-        m.d.comb += self.o_stream.p.eq(rd_port.data)
+        m.d.comb += rd_port.addr.eq(addr >> 1)
+        m.d.comb += self.o_stream.p.eq(rd_port.data.word_select(addr & 1, 8))
+
         with m.If(self.o_stream.ready):
             m.d.sync += next_addr.eq(rd_port.addr + 1)
 
